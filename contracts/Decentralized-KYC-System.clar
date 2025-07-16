@@ -1,0 +1,536 @@
+(define-constant ERR-NOT-AUTHORIZED (err u100))
+(define-constant ERR-ALREADY-VERIFIED (err u101))
+(define-constant ERR-NOT-VERIFIED (err u102))
+(define-constant ERR-EXPIRED (err u103))
+(define-constant ERR-INVALID-STATUS (err u104))
+(define-constant ERR-INVALID-LEVEL (err u105))
+(define-constant ERR-INVALID-PERIOD (err u106))
+(define-constant ERR-SELF-VERIFICATION (err u107))
+(define-constant ERR-INVALID-PROVIDER (err u108))
+
+(define-constant MIN-VALIDITY-PERIOD u43200) ;; Minimum 30 days
+(define-constant MAX-VALIDITY-PERIOD u525600) ;; Maximum 365 days
+(define-constant MAX-KYC-LEVEL u3)
+
+(define-data-var contract-owner principal tx-sender)
+(define-data-var kyc-provider principal tx-sender)
+(define-data-var total-verifications uint u0)
+(define-data-var active-verifications uint u0)
+
+(define-map kyc-records
+  principal
+  {
+    status: (string-ascii 20),
+    verified-at: uint,
+    expires-at: uint,
+    level: uint,
+    verifier: principal,
+    verification-count: uint,
+    last-updated: uint
+  }
+)
+
+(define-map authorized-verifiers 
+  principal 
+  {
+    active: bool,
+    added-at: uint,
+    total-verifications: uint,
+    last-verification: uint
+  }
+)
+
+(define-map verification-history
+  { user: principal, index: uint }
+  {
+    status: (string-ascii 20),
+    timestamp: uint,
+    verifier: principal,
+    level: uint
+  }
+)
+
+(define-public (set-kyc-provider (provider principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq provider tx-sender)) ERR-SELF-VERIFICATION)
+    (var-set kyc-provider provider)
+    (ok true)))
+
+(define-public (add-verifier (verifier principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get kyc-provider)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq verifier tx-sender)) ERR-SELF-VERIFICATION)
+    (ok (map-set authorized-verifiers verifier {
+      active: true,
+      added-at: stacks-block-height,
+      total-verifications: u0,
+      last-verification: u0
+    }))))
+
+(define-public (remove-verifier (verifier principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get kyc-provider)) ERR-NOT-AUTHORIZED)
+    (match (map-get? authorized-verifiers verifier)
+      prev-data (ok (map-set authorized-verifiers verifier 
+        (merge prev-data { active: false })))
+      ERR-INVALID-PROVIDER)))
+
+(define-public (verify-identity (user principal) (level uint) (validity-period uint))
+  (let
+    (
+      (expires-at (+ stacks-block-height validity-period))
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq user tx-sender)) ERR-SELF-VERIFICATION)
+    (asserts! (<= level MAX-KYC-LEVEL) ERR-INVALID-LEVEL)
+    (asserts! (and (>= validity-period MIN-VALIDITY-PERIOD) (<= validity-period MAX-VALIDITY-PERIOD)) ERR-INVALID-PERIOD)
+    (asserts! (is-none (map-get? kyc-records user)) ERR-ALREADY-VERIFIED)
+    (map-set verification-history { user: user, index: (var-get total-verifications) }
+      {
+        status: "VERIFIED",
+        timestamp: stacks-block-height,
+        verifier: tx-sender,
+        level: level
+      })
+    (map-set authorized-verifiers tx-sender 
+      (merge verifier-data {
+        total-verifications: (+ (get total-verifications verifier-data) u1),
+        last-verification: stacks-block-height
+      }))
+    (var-set total-verifications (+ (var-get total-verifications) u1))
+    (var-set active-verifications (+ (var-get active-verifications) u1))
+    (ok (map-set kyc-records user {
+      status: "VERIFIED",
+      verified-at: stacks-block-height,
+      expires-at: expires-at,
+      level: level,
+      verifier: tx-sender,
+      verification-count: u1,
+      last-updated: stacks-block-height
+    }))))
+
+(define-public (revoke-verification (user principal))
+  (let
+    (
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+      (user-record (unwrap! (map-get? kyc-records user) ERR-NOT-VERIFIED))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (map-set verification-history { user: user, index: (var-get total-verifications) }
+      {
+        status: "REVOKED",
+        timestamp: stacks-block-height,
+        verifier: tx-sender,
+        level: u0
+      })
+    (var-set total-verifications (+ (var-get total-verifications) u1))
+    (var-set active-verifications (- (var-get active-verifications) u1))
+    (ok (map-set kyc-records user 
+      (merge user-record {
+        status: "REVOKED",
+        expires-at: stacks-block-height,
+        level: u0,
+        last-updated: stacks-block-height
+      })))))
+
+(define-read-only (get-kyc-status (user principal))
+  (match (map-get? kyc-records user)
+    record (ok record)
+    ERR-NOT-VERIFIED))
+
+(define-read-only (is-verified (user principal))
+  (match (map-get? kyc-records user)
+    record (if (and
+      (is-eq (get status record) "VERIFIED")
+      (< stacks-block-height (get expires-at record)))
+      (ok true)
+      (ok false))
+    (ok false)))
+
+(define-read-only (get-verification-level (user principal))
+  (match (map-get? kyc-records user)
+    record (ok (get level record))
+    (ok u0)))
+
+(define-read-only (is-verifier (address principal))
+  (match (map-get? authorized-verifiers address)
+    verifier-data (ok (get active verifier-data))
+    (ok false)))
+
+(define-read-only (get-verifier-stats (verifier principal))
+  (match (map-get? authorized-verifiers verifier)
+    stats (ok stats)
+    ERR-INVALID-PROVIDER))
+
+(define-read-only (get-contract-stats)
+  (ok {
+    total-verifications: (var-get total-verifications),
+    active-verifications: (var-get active-verifications)
+  }))
+
+(define-constant ERR-INSUFFICIENT-SIGNATURES (err u109))
+(define-constant ERR-ALREADY-SIGNED (err u110))
+(define-constant ERR-PENDING-NOT-FOUND (err u111))
+(define-constant ERR-INVALID-THRESHOLD (err u112))
+
+(define-data-var signature-threshold uint u2)
+(define-data-var pending-verification-counter uint u0)
+
+(define-map pending-verifications
+  uint
+  {
+    user: principal,
+    level: uint,
+    validity-period: uint,
+    created-at: uint,
+    signatures-count: uint,
+    initiator: principal,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map verification-signatures
+  { verification-id: uint, verifier: principal }
+  {
+    signed-at: uint,
+    active: bool
+  }
+)
+
+(define-public (set-signature-threshold (threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get kyc-provider)) ERR-NOT-AUTHORIZED)
+    (asserts! (> threshold u0) ERR-INVALID-THRESHOLD)
+    (var-set signature-threshold threshold)
+    (ok true)))
+
+(define-public (initiate-verification (user principal) (level uint) (validity-period uint))
+  (let
+    (
+      (verification-id (var-get pending-verification-counter))
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq user tx-sender)) ERR-SELF-VERIFICATION)
+    (asserts! (<= level MAX-KYC-LEVEL) ERR-INVALID-LEVEL)
+    (asserts! (and (>= validity-period MIN-VALIDITY-PERIOD) (<= validity-period MAX-VALIDITY-PERIOD)) ERR-INVALID-PERIOD)
+    (asserts! (is-none (map-get? kyc-records user)) ERR-ALREADY-VERIFIED)
+    (map-set pending-verifications verification-id {
+      user: user,
+      level: level,
+      validity-period: validity-period,
+      created-at: stacks-block-height,
+      signatures-count: u1,
+      initiator: tx-sender,
+      status: "PENDING"
+    })
+    (map-set verification-signatures { verification-id: verification-id, verifier: tx-sender } {
+      signed-at: stacks-block-height,
+      active: true
+    })
+    (var-set pending-verification-counter (+ verification-id u1))
+    (ok verification-id)))
+
+(define-public (sign-verification (verification-id uint))
+  (let
+    (
+      (pending-verification (unwrap! (map-get? pending-verifications verification-id) ERR-PENDING-NOT-FOUND))
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+      (signature-key { verification-id: verification-id, verifier: tx-sender })
+      (new-signature-count (+ (get signatures-count pending-verification) u1))
+      (threshold (var-get signature-threshold))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status pending-verification) "PENDING") ERR-INVALID-STATUS)
+    (asserts! (is-none (map-get? verification-signatures signature-key)) ERR-ALREADY-SIGNED)
+    (map-set verification-signatures signature-key {
+      signed-at: stacks-block-height,
+      active: true
+    })
+    (map-set pending-verifications verification-id
+      (merge pending-verification { signatures-count: new-signature-count }))
+    (if (>= new-signature-count threshold)
+      (finalize-verification verification-id)
+      (ok true))))
+
+(define-private (finalize-verification (verification-id uint))
+  (let
+    (
+      (pending-verification (unwrap! (map-get? pending-verifications verification-id) ERR-PENDING-NOT-FOUND))
+      (user (get user pending-verification))
+      (level (get level pending-verification))
+      (validity-period (get validity-period pending-verification))
+      (expires-at (+ stacks-block-height validity-period))
+    )
+    (map-set pending-verifications verification-id
+      (merge pending-verification { status: "COMPLETED" }))
+    (map-set verification-history { user: user, index: (var-get total-verifications) }
+      {
+        status: "VERIFIED",
+        timestamp: stacks-block-height,
+        verifier: (get initiator pending-verification),
+        level: level
+      })
+    (var-set total-verifications (+ (var-get total-verifications) u1))
+    (var-set active-verifications (+ (var-get active-verifications) u1))
+    (ok (map-set kyc-records user {
+      status: "VERIFIED",
+      verified-at: stacks-block-height,
+      expires-at: expires-at,
+      level: level,
+      verifier: (get initiator pending-verification),
+      verification-count: u1,
+      last-updated: stacks-block-height
+    }))))
+
+(define-read-only (get-pending-verification (verification-id uint))
+  (match (map-get? pending-verifications verification-id)
+    verification (ok verification)
+    ERR-PENDING-NOT-FOUND))
+
+(define-read-only (get-signature-threshold)
+  (ok (var-get signature-threshold)))
+
+(define-read-only (has-signed-verification (verification-id uint) (verifier principal))
+  (is-some (map-get? verification-signatures { verification-id: verification-id, verifier: verifier })))
+
+  (define-constant ERR-INVALID-RATING (err u113))
+(define-constant ERR-CANNOT-RATE-SELF (err u114))
+(define-constant ERR-ALREADY-RATED (err u115))
+(define-constant ERR-LOW-REPUTATION (err u116))
+
+(define-constant MIN-REPUTATION-SCORE u50)
+(define-constant MAX-RATING u5)
+
+(define-data-var reputation-update-counter uint u0)
+
+(define-map verifier-reputation
+  principal
+  {
+    score: uint,
+    total-ratings: uint,
+    average-rating: uint,
+    successful-verifications: uint,
+    disputed-verifications: uint,
+    last-updated: uint,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map user-trust-scores
+  principal
+  {
+    score: uint,
+    verification-history-count: uint,
+    revocation-count: uint,
+    last-calculated: uint
+  }
+)
+
+(define-map verifier-ratings
+  { rater: principal, rated: principal, period: uint }
+  {
+    rating: uint,
+    comment: (string-ascii 100),
+    timestamp: uint
+  }
+)
+
+(define-map reputation-events
+  uint
+  {
+    event-type: (string-ascii 20),
+    verifier: principal,
+    user: (optional principal),
+    impact: int,
+    timestamp: uint
+  }
+)
+
+(define-public (rate-verifier (verifier principal) (rating uint) (comment (string-ascii 100)))
+  (let
+    (
+      (rater-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+      (rating-key { rater: tx-sender, rated: verifier, period: (/ stacks-block-height u1440) })
+      (current-reputation (default-to { 
+        score: u100, 
+        total-ratings: u0, 
+        average-rating: u0, 
+        successful-verifications: u0, 
+        disputed-verifications: u0, 
+        last-updated: u0,
+        status: "ACTIVE"
+      } (map-get? verifier-reputation verifier)))
+    )
+    (asserts! (get active rater-data) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq tx-sender verifier)) ERR-CANNOT-RATE-SELF)
+    (asserts! (and (>= rating u1) (<= rating MAX-RATING)) ERR-INVALID-RATING)
+    (asserts! (is-none (map-get? verifier-ratings rating-key)) ERR-ALREADY-RATED)
+    (map-set verifier-ratings rating-key {
+      rating: rating,
+      comment: comment,
+      timestamp: stacks-block-height
+    })
+    (let
+      (
+        (new-total-ratings (+ (get total-ratings current-reputation) u1))
+        (new-average (/ (+ (* (get average-rating current-reputation) (get total-ratings current-reputation)) rating) new-total-ratings))
+        (reputation-impact (if (> rating u3) u5 u5))
+        (new-score (if (> rating u3)
+                      (if (> (+ (get score current-reputation) u5) u200)
+                          u200
+                          (+ (get score current-reputation) u5))
+                      (if (> (get score current-reputation) u5)
+                          (- (get score current-reputation) u5)
+                          u0)))
+      )
+      (map-set verifier-reputation verifier
+        (merge current-reputation {
+          total-ratings: new-total-ratings,
+          average-rating: new-average,
+          score: new-score,
+          last-updated: stacks-block-height
+        }))
+      (map-set reputation-events (var-get reputation-update-counter) {
+        event-type: "RATING",
+        verifier: verifier,
+        user: none,
+        impact: (if (> rating u3) 5 -5),
+        timestamp: stacks-block-height
+      })
+      (var-set reputation-update-counter (+ (var-get reputation-update-counter) u1))
+      (ok true))))
+(define-public (update-verifier-reputation (verifier principal) (event-type (string-ascii 20)) (impact int))
+  (let
+    (
+      (current-reputation (default-to { 
+        score: u100, 
+        total-ratings: u0, 
+        average-rating: u0, 
+        successful-verifications: u0, 
+        disputed-verifications: u0, 
+        last-updated: u0,
+        status: "ACTIVE"
+      } (map-get? verifier-reputation verifier)))
+    )
+    (asserts! (is-eq tx-sender (var-get kyc-provider)) ERR-NOT-AUTHORIZED)
+    (let
+      (
+        (current-score (get score current-reputation))
+        (new-score (if (< impact 0)
+                      (if (> current-score (to-uint (- 0 impact)))
+                          (- current-score (to-uint (- 0 impact)))
+                          u0)
+                      (if (< (+ current-score (to-uint impact)) u200)
+                          (+ current-score (to-uint impact))
+                          u200)))
+        (successful-count (if (is-eq event-type "SUCCESS") 
+                             (+ (get successful-verifications current-reputation) u1)
+                             (get successful-verifications current-reputation)))
+        (disputed-count (if (is-eq event-type "DISPUTE") 
+                           (+ (get disputed-verifications current-reputation) u1)
+                           (get disputed-verifications current-reputation)))
+      )
+      (map-set verifier-reputation verifier
+        (merge current-reputation {
+          score: new-score,
+          successful-verifications: successful-count,
+          disputed-verifications: disputed-count,
+          last-updated: stacks-block-height,
+          status: (if (< new-score MIN-REPUTATION-SCORE) "SUSPENDED" "ACTIVE")
+        }))
+      (map-set reputation-events (var-get reputation-update-counter) {
+        event-type: event-type,
+        verifier: verifier,
+        user: none,
+        impact: impact,
+        timestamp: stacks-block-height
+      })
+      (var-set reputation-update-counter (+ (var-get reputation-update-counter) u1))
+      (ok true))))
+
+(define-public (calculate-user-trust-score (user principal))
+  (let
+    (
+      (kyc-record (map-get? kyc-records user))
+      (current-trust (default-to { 
+        score: u50, 
+        verification-history-count: u0, 
+        revocation-count: u0, 
+        last-calculated: u0 
+      } (map-get? user-trust-scores user)))
+    )
+    (match kyc-record
+      record (let
+        (
+          (verification-count (get verification-count record))
+          (is-currently-verified (and (is-eq (get status record) "VERIFIED") 
+                                     (< stacks-block-height (get expires-at record))))
+          (base-score u50)
+          (verification-bonus (* verification-count u10))
+          (status-bonus (if is-currently-verified u20 u0))
+          (revocation-penalty (* (get revocation-count current-trust) u15))
+          (calculated-score (if (> (+ base-score verification-bonus status-bonus) revocation-penalty)
+                               (- (+ base-score verification-bonus status-bonus) revocation-penalty)
+                               u0))
+          (final-score (if (> calculated-score u100) u100 calculated-score))
+        )
+        (ok (map-set user-trust-scores user {
+          score: final-score,
+          verification-history-count: verification-count,
+          revocation-count: (get revocation-count current-trust),
+          last-calculated: stacks-block-height
+        })))
+      (ok (map-set user-trust-scores user
+        (merge current-trust { 
+          score: u25,
+          last-calculated: stacks-block-height 
+        }))))))
+
+(define-read-only (get-verifier-reputation (verifier principal))
+  (match (map-get? verifier-reputation verifier)
+    reputation (ok reputation)
+    (ok { 
+      score: u100, 
+      total-ratings: u0, 
+      average-rating: u0, 
+      successful-verifications: u0, 
+      disputed-verifications: u0, 
+      last-updated: u0,
+      status: "ACTIVE"
+    })))
+(define-read-only (get-user-trust-score (user principal))
+  (match (map-get? user-trust-scores user)
+    trust-data (ok trust-data)
+    (ok { 
+      score: u50, 
+      verification-history-count: u0, 
+      revocation-count: u0, 
+      last-calculated: u0 
+    })))
+
+(define-read-only (get-verifier-rating (rater principal) (rated principal) (period uint))
+  (match (map-get? verifier-ratings { rater: rater, rated: rated, period: period })
+    rating (ok rating)
+    ERR-PENDING-NOT-FOUND))
+
+(define-read-only (can-verify-based-on-reputation (verifier principal))
+  (match (map-get? verifier-reputation verifier)
+    reputation (ok (and 
+      (>= (get score reputation) MIN-REPUTATION-SCORE)
+      (is-eq (get status reputation) "ACTIVE")))
+    (ok true)))
+
+(define-read-only (get-reputation-event (event-id uint))
+  (match (map-get? reputation-events event-id)
+    event (ok event)
+    ERR-PENDING-NOT-FOUND))
+
+(define-read-only (get-reputation-stats)
+  (ok {
+    total-reputation-events: (var-get reputation-update-counter),
+    min-reputation-threshold: MIN-REPUTATION-SCORE,
+    max-rating: MAX-RATING
+  }))

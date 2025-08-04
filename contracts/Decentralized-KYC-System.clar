@@ -300,11 +300,52 @@
 (define-constant ERR-CANNOT-RATE-SELF (err u114))
 (define-constant ERR-ALREADY-RATED (err u115))
 (define-constant ERR-LOW-REPUTATION (err u116))
+(define-constant ERR-INSUFFICIENT-PAYMENT (err u117))
+(define-constant ERR-INVALID-FEE (err u118))
+(define-constant ERR-WITHDRAWAL-FAILED (err u119))
+(define-constant ERR-INVALID-WITHDRAWAL (err u120))
 
 (define-constant MIN-REPUTATION-SCORE u50)
 (define-constant MAX-RATING u5)
+(define-constant PLATFORM-FEE-PERCENTAGE u10)
+(define-constant MIN-VERIFICATION-FEE u1000)
+(define-constant MAX-VERIFICATION-FEE u100000)
 
 (define-data-var reputation-update-counter uint u0)
+(define-data-var total-platform-earnings uint u0)
+
+(define-map verifier-fees
+  principal
+  {
+    level-1-fee: uint,
+    level-2-fee: uint,
+    level-3-fee: uint,
+    total-earned: uint,
+    pending-withdrawal: uint,
+    last-updated: uint
+  }
+)
+
+(define-map verifier-earnings
+  principal
+  uint
+)
+
+(define-map platform-earnings
+  uint
+  uint
+)
+
+(define-map verification-payments
+  { user: principal, verification-id: uint }
+  {
+    total-fee: uint,
+    verifier-share: uint,
+    platform-share: uint,
+    paid-at: uint,
+    status: (string-ascii 20)
+  }
+)
 
 (define-map verifier-reputation
   principal
@@ -533,4 +574,159 @@
     total-reputation-events: (var-get reputation-update-counter),
     min-reputation-threshold: MIN-REPUTATION-SCORE,
     max-rating: MAX-RATING
+  }))
+
+(define-public (set-verifier-fees (level-1-fee uint) (level-2-fee uint) (level-3-fee uint))
+  (let
+    (
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= level-1-fee MIN-VERIFICATION-FEE) (<= level-1-fee MAX-VERIFICATION-FEE)) ERR-INVALID-FEE)
+    (asserts! (and (>= level-2-fee MIN-VERIFICATION-FEE) (<= level-2-fee MAX-VERIFICATION-FEE)) ERR-INVALID-FEE)
+    (asserts! (and (>= level-3-fee MIN-VERIFICATION-FEE) (<= level-3-fee MAX-VERIFICATION-FEE)) ERR-INVALID-FEE)
+    (ok (map-set verifier-fees tx-sender {
+      level-1-fee: level-1-fee,
+      level-2-fee: level-2-fee,
+      level-3-fee: level-3-fee,
+      total-earned: u0,
+      pending-withdrawal: u0,
+      last-updated: stacks-block-height
+    }))))
+
+(define-public (verify-identity-with-payment (user principal) (level uint) (validity-period uint))
+  (let
+    (
+      (expires-at (+ stacks-block-height validity-period))
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+      (fee-data (unwrap! (map-get? verifier-fees tx-sender) ERR-INVALID-FEE))
+      (verification-fee (if (is-eq level u1)
+                          (get level-1-fee fee-data)
+                          (if (is-eq level u2)
+                            (get level-2-fee fee-data)
+                            (get level-3-fee fee-data))))
+      (platform-fee (/ (* verification-fee PLATFORM-FEE-PERCENTAGE) u100))
+      (verifier-share (- verification-fee platform-fee))
+      (payment-amount (stx-get-balance user))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq user tx-sender)) ERR-SELF-VERIFICATION)
+    (asserts! (<= level MAX-KYC-LEVEL) ERR-INVALID-LEVEL)
+    (asserts! (and (>= validity-period MIN-VALIDITY-PERIOD) (<= validity-period MAX-VALIDITY-PERIOD)) ERR-INVALID-PERIOD)
+    (asserts! (is-none (map-get? kyc-records user)) ERR-ALREADY-VERIFIED)
+    (asserts! (>= payment-amount verification-fee) ERR-INSUFFICIENT-PAYMENT)
+    
+    (try! (stx-transfer? verification-fee user (as-contract tx-sender)))
+    
+    (map-set verification-payments { user: user, verification-id: (var-get total-verifications) } {
+      total-fee: verification-fee,
+      verifier-share: verifier-share,
+      platform-share: platform-fee,
+      paid-at: stacks-block-height,
+      status: "PAID"
+    })
+    
+    (map-set verifier-earnings tx-sender 
+      (+ (default-to u0 (map-get? verifier-earnings tx-sender)) verifier-share))
+    
+    (var-set total-platform-earnings (+ (var-get total-platform-earnings) platform-fee))
+    
+    (map-set verification-history { user: user, index: (var-get total-verifications) }
+      {
+        status: "VERIFIED",
+        timestamp: stacks-block-height,
+        verifier: tx-sender,
+        level: level
+      })
+    
+    (map-set authorized-verifiers tx-sender 
+      (merge verifier-data {
+        total-verifications: (+ (get total-verifications verifier-data) u1),
+        last-verification: stacks-block-height
+      }))
+    
+    (var-set total-verifications (+ (var-get total-verifications) u1))
+    (var-set active-verifications (+ (var-get active-verifications) u1))
+    
+    (ok (map-set kyc-records user {
+      status: "VERIFIED",
+      verified-at: stacks-block-height,
+      expires-at: expires-at,
+      level: level,
+      verifier: tx-sender,
+      verification-count: u1,
+      last-updated: stacks-block-height
+    }))))
+
+(define-public (withdraw-earnings)
+  (let
+    (
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+      (pending-amount (default-to u0 (map-get? verifier-earnings tx-sender)))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (asserts! (> pending-amount u0) ERR-INVALID-WITHDRAWAL)
+    
+    (try! (as-contract (stx-transfer? pending-amount tx-sender tx-sender)))
+    
+    (map-set verifier-earnings tx-sender u0)
+    (ok pending-amount)))
+
+(define-public (withdraw-platform-earnings (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get kyc-provider)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= amount (var-get total-platform-earnings)) ERR-INVALID-WITHDRAWAL)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    
+    (var-set total-platform-earnings (- (var-get total-platform-earnings) amount))
+    (ok amount)))
+
+(define-read-only (get-verifier-fees (verifier principal))
+  (match (map-get? verifier-fees verifier)
+    fees (ok fees)
+    (ok {
+      level-1-fee: MIN-VERIFICATION-FEE,
+      level-2-fee: MIN-VERIFICATION-FEE,
+      level-3-fee: MIN-VERIFICATION-FEE,
+      total-earned: u0,
+      pending-withdrawal: u0,
+      last-updated: u0
+    })))
+
+(define-read-only (get-verification-cost (verifier principal) (level uint))
+  (let
+    (
+      (fee-data (default-to {
+        level-1-fee: MIN-VERIFICATION-FEE,
+        level-2-fee: MIN-VERIFICATION-FEE,
+        level-3-fee: MIN-VERIFICATION-FEE,
+        total-earned: u0,
+        pending-withdrawal: u0,
+        last-updated: u0
+      } (map-get? verifier-fees verifier)))
+    )
+    (ok (if (is-eq level u1)
+          (get level-1-fee fee-data)
+          (if (is-eq level u2)
+            (get level-2-fee fee-data)
+            (get level-3-fee fee-data))))))
+
+(define-read-only (get-verifier-earnings (verifier principal))
+  (ok (default-to u0 (map-get? verifier-earnings verifier))))
+
+(define-read-only (get-platform-earnings)
+  (ok (var-get total-platform-earnings)))
+
+(define-read-only (get-verification-payment (user principal) (verification-id uint))
+  (match (map-get? verification-payments { user: user, verification-id: verification-id })
+    payment (ok payment)
+    ERR-PENDING-NOT-FOUND))
+
+(define-read-only (get-fee-stats)
+  (ok {
+    platform-fee-percentage: PLATFORM-FEE-PERCENTAGE,
+    min-verification-fee: MIN-VERIFICATION-FEE,
+    max-verification-fee: MAX-VERIFICATION-FEE,
+    total-platform-earnings: (var-get total-platform-earnings)
   }))

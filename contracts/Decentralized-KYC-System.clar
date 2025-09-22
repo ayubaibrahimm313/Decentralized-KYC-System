@@ -730,3 +730,144 @@
     max-verification-fee: MAX-VERIFICATION-FEE,
     total-platform-earnings: (var-get total-platform-earnings)
   }))
+
+(define-constant ERR-NOTIFICATION-NOT-FOUND (err u121))
+(define-constant ERR-NOTIFICATION-ALREADY-EXISTS (err u122))
+(define-constant ERR-INVALID-NOTIFICATION-THRESHOLD (err u123))
+
+(define-constant DEFAULT-EXPIRATION-THRESHOLD u4320)
+(define-constant MAX-EXPIRATION-THRESHOLD u14400)
+
+(define-data-var notification-counter uint u0)
+(define-data-var global-notification-threshold uint DEFAULT-EXPIRATION-THRESHOLD)
+
+(define-map expiration-notifications
+  principal
+  {
+    threshold-blocks: uint,
+    last-notification: uint,
+    notification-count: uint,
+    enabled: bool,
+    created-at: uint
+  }
+)
+
+(define-map notification-history
+  uint
+  {
+    user: principal,
+    notification-type: (string-ascii 20),
+    blocks-until-expiry: uint,
+    triggered-at: uint,
+    expires-at: uint
+  }
+)
+
+(define-public (set-expiration-notification (threshold-blocks uint))
+  (begin
+    (asserts! (<= threshold-blocks MAX-EXPIRATION-THRESHOLD) ERR-INVALID-NOTIFICATION-THRESHOLD)
+    (asserts! (> threshold-blocks u0) ERR-INVALID-NOTIFICATION-THRESHOLD)
+    (ok (map-set expiration-notifications tx-sender {
+      threshold-blocks: threshold-blocks,
+      last-notification: u0,
+      notification-count: u0,
+      enabled: true,
+      created-at: stacks-block-height
+    }))))
+
+(define-public (disable-expiration-notification)
+  (match (map-get? expiration-notifications tx-sender)
+    current-settings (ok (map-set expiration-notifications tx-sender
+      (merge current-settings { enabled: false })))
+    ERR-NOTIFICATION-NOT-FOUND))
+
+(define-public (trigger-expiration-notification (user principal))
+  (let
+    (
+      (user-record (unwrap! (map-get? kyc-records user) ERR-NOT-VERIFIED))
+      (notification-settings (unwrap! (map-get? expiration-notifications user) ERR-NOTIFICATION-NOT-FOUND))
+      (blocks-until-expiry (if (> (get expires-at user-record) stacks-block-height)
+                             (- (get expires-at user-record) stacks-block-height)
+                             u0))
+      (notification-id (var-get notification-counter))
+    )
+    (asserts! (get enabled notification-settings) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status user-record) "VERIFIED") ERR-NOT-VERIFIED)
+    (asserts! (<= blocks-until-expiry (get threshold-blocks notification-settings)) ERR-INVALID-NOTIFICATION-THRESHOLD)
+    (map-set notification-history notification-id {
+      user: user,
+      notification-type: "EXPIRY_WARNING",
+      blocks-until-expiry: blocks-until-expiry,
+      triggered-at: stacks-block-height,
+      expires-at: (get expires-at user-record)
+    })
+    (map-set expiration-notifications user
+      (merge notification-settings {
+        last-notification: stacks-block-height,
+        notification-count: (+ (get notification-count notification-settings) u1)
+      }))
+    (var-set notification-counter (+ notification-id u1))
+    (ok notification-id)))
+
+(define-public (set-global-notification-threshold (threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get kyc-provider)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= threshold MAX-EXPIRATION-THRESHOLD) ERR-INVALID-NOTIFICATION-THRESHOLD)
+    (asserts! (> threshold u0) ERR-INVALID-NOTIFICATION-THRESHOLD)
+    (var-set global-notification-threshold threshold)
+    (ok true)))
+
+(define-read-only (get-expiration-notification-settings (user principal))
+  (match (map-get? expiration-notifications user)
+    settings (ok settings)
+    (ok {
+      threshold-blocks: (var-get global-notification-threshold),
+      last-notification: u0,
+      notification-count: u0,
+      enabled: false,
+      created-at: u0
+    })))
+
+(define-read-only (get-notification-history (notification-id uint))
+  (match (map-get? notification-history notification-id)
+    notification (ok notification)
+    ERR-NOTIFICATION-NOT-FOUND))
+
+(define-read-only (check-expiration-status (user principal))
+  (match (map-get? kyc-records user)
+    record (let
+      (
+        (blocks-until-expiry (if (> (get expires-at record) stacks-block-height)
+                               (- (get expires-at record) stacks-block-height)
+                               u0))
+        (notification-settings (map-get? expiration-notifications user))
+        (threshold (match notification-settings
+                     settings (get threshold-blocks settings)
+                     (var-get global-notification-threshold)))
+        (needs-notification (and (is-eq (get status record) "VERIFIED")
+                                (<= blocks-until-expiry threshold)
+                                (> blocks-until-expiry u0)))
+      )
+      (ok {
+        expires-at: (get expires-at record),
+        blocks-until-expiry: blocks-until-expiry,
+        needs-notification: needs-notification,
+        notification-threshold: threshold,
+        is-expired: (>= stacks-block-height (get expires-at record))
+      }))
+    ERR-NOT-VERIFIED))
+
+(define-read-only (get-users-needing-notification)
+  (ok {
+    global-threshold: (var-get global-notification-threshold),
+    current-block: stacks-block-height,
+    total-notifications: (var-get notification-counter)
+  }))
+
+(define-read-only (get-notification-stats)
+  (ok {
+    total-notifications-sent: (var-get notification-counter),
+    global-threshold-blocks: (var-get global-notification-threshold),
+    max-threshold-blocks: MAX-EXPIRATION-THRESHOLD,
+    default-threshold-blocks: DEFAULT-EXPIRATION-THRESHOLD
+  }))

@@ -304,15 +304,20 @@
 (define-constant ERR-INVALID-FEE (err u118))
 (define-constant ERR-WITHDRAWAL-FAILED (err u119))
 (define-constant ERR-INVALID-WITHDRAWAL (err u120))
+(define-constant ERR-NOT-RENEWABLE (err u124))
+(define-constant ERR-RENEWAL-WINDOW-NOT-OPEN (err u125))
 
 (define-constant MIN-REPUTATION-SCORE u50)
 (define-constant MAX-RATING u5)
 (define-constant PLATFORM-FEE-PERCENTAGE u10)
 (define-constant MIN-VERIFICATION-FEE u1000)
 (define-constant MAX-VERIFICATION-FEE u100000)
+(define-constant RENEWAL-WINDOW-BLOCKS u7200)
+(define-constant RENEWAL-DISCOUNT-PERCENTAGE u20)
 
 (define-data-var reputation-update-counter uint u0)
 (define-data-var total-platform-earnings uint u0)
+(define-data-var total-renewals uint u0)
 
 (define-map verifier-fees
   principal
@@ -387,6 +392,29 @@
     user: (optional principal),
     impact: int,
     timestamp: uint
+  }
+)
+
+(define-map renewal-history
+  { user: principal, renewal-index: uint }
+  {
+    previous-expiry: uint,
+    new-expiry: uint,
+    renewed-at: uint,
+    verifier: principal,
+    fee-paid: uint,
+    discount-applied: uint,
+    level: uint
+  }
+)
+
+(define-map user-renewal-stats
+  principal
+  {
+    total-renewals: uint,
+    last-renewal: uint,
+    consecutive-renewals: uint,
+    lifetime-discount-saved: uint
   }
 )
 
@@ -870,4 +898,138 @@
     global-threshold-blocks: (var-get global-notification-threshold),
     max-threshold-blocks: MAX-EXPIRATION-THRESHOLD,
     default-threshold-blocks: DEFAULT-EXPIRATION-THRESHOLD
+  }))
+
+(define-public (renew-verification (user principal) (validity-period uint))
+  (let
+    (
+      (user-record (unwrap! (map-get? kyc-records user) ERR-NOT-VERIFIED))
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+      (fee-data (unwrap! (map-get? verifier-fees tx-sender) ERR-INVALID-FEE))
+      (current-level (get level user-record))
+      (current-expiry (get expires-at user-record))
+      (blocks-until-expiry (if (> current-expiry stacks-block-height)
+                             (- current-expiry stacks-block-height)
+                             u0))
+      (base-fee (if (is-eq current-level u1)
+                   (get level-1-fee fee-data)
+                   (if (is-eq current-level u2)
+                     (get level-2-fee fee-data)
+                     (get level-3-fee fee-data))))
+      (discount-amount (/ (* base-fee RENEWAL-DISCOUNT-PERCENTAGE) u100))
+      (renewal-fee (- base-fee discount-amount))
+      (platform-fee (/ (* renewal-fee PLATFORM-FEE-PERCENTAGE) u100))
+      (verifier-share (- renewal-fee platform-fee))
+      (new-expiry (+ current-expiry validity-period))
+      (renewal-stats (default-to {
+        total-renewals: u0,
+        last-renewal: u0,
+        consecutive-renewals: u0,
+        lifetime-discount-saved: u0
+      } (map-get? user-renewal-stats user)))
+      (payment-amount (stx-get-balance user))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq user tx-sender)) ERR-SELF-VERIFICATION)
+    (asserts! (is-eq (get status user-record) "VERIFIED") ERR-NOT-RENEWABLE)
+    (asserts! (<= blocks-until-expiry RENEWAL-WINDOW-BLOCKS) ERR-RENEWAL-WINDOW-NOT-OPEN)
+    (asserts! (> blocks-until-expiry u0) ERR-EXPIRED)
+    (asserts! (and (>= validity-period MIN-VALIDITY-PERIOD) (<= validity-period MAX-VALIDITY-PERIOD)) ERR-INVALID-PERIOD)
+    (asserts! (>= payment-amount renewal-fee) ERR-INSUFFICIENT-PAYMENT)
+    (try! (stx-transfer? renewal-fee user (as-contract tx-sender)))
+    (map-set renewal-history { user: user, renewal-index: (get total-renewals renewal-stats) } {
+      previous-expiry: current-expiry,
+      new-expiry: new-expiry,
+      renewed-at: stacks-block-height,
+      verifier: tx-sender,
+      fee-paid: renewal-fee,
+      discount-applied: discount-amount,
+      level: current-level
+    })
+    (map-set user-renewal-stats user {
+      total-renewals: (+ (get total-renewals renewal-stats) u1),
+      last-renewal: stacks-block-height,
+      consecutive-renewals: (+ (get consecutive-renewals renewal-stats) u1),
+      lifetime-discount-saved: (+ (get lifetime-discount-saved renewal-stats) discount-amount)
+    })
+    (map-set verifier-earnings tx-sender
+      (+ (default-to u0 (map-get? verifier-earnings tx-sender)) verifier-share))
+    (var-set total-platform-earnings (+ (var-get total-platform-earnings) platform-fee))
+    (map-set authorized-verifiers tx-sender
+      (merge verifier-data {
+        total-verifications: (+ (get total-verifications verifier-data) u1),
+        last-verification: stacks-block-height
+      }))
+    (var-set total-renewals (+ (var-get total-renewals) u1))
+    (ok (map-set kyc-records user
+      (merge user-record {
+        expires-at: new-expiry,
+        verification-count: (+ (get verification-count user-record) u1),
+        last-updated: stacks-block-height
+      })))))
+
+(define-read-only (check-renewal-eligibility (user principal))
+  (match (map-get? kyc-records user)
+    record (let
+      (
+        (blocks-until-expiry (if (> (get expires-at record) stacks-block-height)
+                               (- (get expires-at record) stacks-block-height)
+                               u0))
+        (is-eligible (and
+          (is-eq (get status record) "VERIFIED")
+          (<= blocks-until-expiry RENEWAL-WINDOW-BLOCKS)
+          (> blocks-until-expiry u0)))
+      )
+      (ok {
+        eligible: is-eligible,
+        current-expiry: (get expires-at record),
+        blocks-until-expiry: blocks-until-expiry,
+        renewal-window-blocks: RENEWAL-WINDOW-BLOCKS,
+        level: (get level record)
+      }))
+    ERR-NOT-VERIFIED))
+
+(define-read-only (calculate-renewal-cost (user principal) (verifier principal))
+  (match (map-get? kyc-records user)
+    record (match (map-get? verifier-fees verifier)
+      fees (let
+        (
+          (current-level (get level record))
+          (base-fee (if (is-eq current-level u1)
+                      (get level-1-fee fees)
+                      (if (is-eq current-level u2)
+                        (get level-2-fee fees)
+                        (get level-3-fee fees))))
+          (discount (/ (* base-fee RENEWAL-DISCOUNT-PERCENTAGE) u100))
+          (renewal-fee (- base-fee discount))
+        )
+        (ok {
+          base-fee: base-fee,
+          discount-amount: discount,
+          discount-percentage: RENEWAL-DISCOUNT-PERCENTAGE,
+          final-fee: renewal-fee
+        }))
+      ERR-INVALID-FEE)
+    ERR-NOT-VERIFIED))
+
+(define-read-only (get-renewal-stats (user principal))
+  (match (map-get? user-renewal-stats user)
+    stats (ok stats)
+    (ok {
+      total-renewals: u0,
+      last-renewal: u0,
+      consecutive-renewals: u0,
+      lifetime-discount-saved: u0
+    })))
+
+(define-read-only (get-renewal-history (user principal) (renewal-index uint))
+  (match (map-get? renewal-history { user: user, renewal-index: renewal-index })
+    history (ok history)
+    ERR-PENDING-NOT-FOUND))
+
+(define-read-only (get-global-renewal-stats)
+  (ok {
+    total-renewals: (var-get total-renewals),
+    renewal-window-blocks: RENEWAL-WINDOW-BLOCKS,
+    renewal-discount-percentage: RENEWAL-DISCOUNT-PERCENTAGE
   }))

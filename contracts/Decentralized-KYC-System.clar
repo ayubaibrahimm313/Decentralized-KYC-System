@@ -306,6 +306,11 @@
 (define-constant ERR-INVALID-WITHDRAWAL (err u120))
 (define-constant ERR-NOT-RENEWABLE (err u124))
 (define-constant ERR-RENEWAL-WINDOW-NOT-OPEN (err u125))
+(define-constant ERR-BULK-VERIFICATION-FAILED (err u126))
+(define-constant ERR-EMPTY-BULK-LIST (err u127))
+(define-constant ERR-BULK-LIST-TOO-LARGE (err u128))
+
+(define-constant MAX-BULK-VERIFICATIONS u10)
 
 (define-constant MIN-REPUTATION-SCORE u50)
 (define-constant MAX-RATING u5)
@@ -318,6 +323,7 @@
 (define-data-var reputation-update-counter uint u0)
 (define-data-var total-platform-earnings uint u0)
 (define-data-var total-renewals uint u0)
+(define-data-var total-bulk-verifications uint u0)
 
 (define-map verifier-fees
   principal
@@ -415,6 +421,19 @@
     last-renewal: uint,
     consecutive-renewals: uint,
     lifetime-discount-saved: uint
+  }
+)
+
+(define-map bulk-verification-batches
+  uint
+  {
+    verifier: principal,
+    total-users: uint,
+    successful-count: uint,
+    failed-count: uint,
+    total-fees-collected: uint,
+    processed-at: uint,
+    level: uint
   }
 )
 
@@ -1032,4 +1051,149 @@
     total-renewals: (var-get total-renewals),
     renewal-window-blocks: RENEWAL-WINDOW-BLOCKS,
     renewal-discount-percentage: RENEWAL-DISCOUNT-PERCENTAGE
+  }))
+
+(define-private (process-single-verification
+  (user-data { user: principal, validity-period: uint })
+  (acc { successful: uint, failed: uint, total-fees: uint, level: uint, verifier: principal, verifier-data: { active: bool, added-at: uint, total-verifications: uint, last-verification: uint }, fee-data: { level-1-fee: uint, level-2-fee: uint, level-3-fee: uint, total-earned: uint, pending-withdrawal: uint, last-updated: uint } }))
+  (let
+    (
+      (user (get user user-data))
+      (validity-period (get validity-period user-data))
+      (level (get level acc))
+      (verifier (get verifier acc))
+      (expires-at (+ stacks-block-height validity-period))
+      (verification-fee (if (is-eq level u1)
+                          (get level-1-fee (get fee-data acc))
+                          (if (is-eq level u2)
+                            (get level-2-fee (get fee-data acc))
+                            (get level-3-fee (get fee-data acc)))))
+      (platform-fee (/ (* verification-fee PLATFORM-FEE-PERCENTAGE) u100))
+      (verifier-share (- verification-fee platform-fee))
+      (payment-amount (stx-get-balance user))
+    )
+    (if (and
+          (not (is-eq user verifier))
+          (<= level MAX-KYC-LEVEL)
+          (>= validity-period MIN-VALIDITY-PERIOD)
+          (<= validity-period MAX-VALIDITY-PERIOD)
+          (is-none (map-get? kyc-records user))
+          (>= payment-amount verification-fee))
+      (match (stx-transfer? verification-fee user (as-contract tx-sender))
+        success (begin
+          (map-set verification-payments { user: user, verification-id: (var-get total-verifications) } {
+            total-fee: verification-fee,
+            verifier-share: verifier-share,
+            platform-share: platform-fee,
+            paid-at: stacks-block-height,
+            status: "PAID"
+          })
+          (map-set verification-history { user: user, index: (var-get total-verifications) } {
+            status: "VERIFIED",
+            timestamp: stacks-block-height,
+            verifier: verifier,
+            level: level
+          })
+          (map-set kyc-records user {
+            status: "VERIFIED",
+            verified-at: stacks-block-height,
+            expires-at: expires-at,
+            level: level,
+            verifier: verifier,
+            verification-count: u1,
+            last-updated: stacks-block-height
+          })
+          (var-set total-verifications (+ (var-get total-verifications) u1))
+          (var-set active-verifications (+ (var-get active-verifications) u1))
+          {
+            successful: (+ (get successful acc) u1),
+            failed: (get failed acc),
+            total-fees: (+ (get total-fees acc) verification-fee),
+            level: level,
+            verifier: verifier,
+            verifier-data: (get verifier-data acc),
+            fee-data: (get fee-data acc)
+          })
+        error {
+          successful: (get successful acc),
+          failed: (+ (get failed acc) u1),
+          total-fees: (get total-fees acc),
+          level: level,
+          verifier: verifier,
+          verifier-data: (get verifier-data acc),
+          fee-data: (get fee-data acc)
+        })
+      {
+        successful: (get successful acc),
+        failed: (+ (get failed acc) u1),
+        total-fees: (get total-fees acc),
+        level: level,
+        verifier: verifier,
+        verifier-data: (get verifier-data acc),
+        fee-data: (get fee-data acc)
+      })))
+
+(define-public (bulk-verify-identities
+  (users (list 10 { user: principal, validity-period: uint }))
+  (level uint))
+  (let
+    (
+      (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) ERR-NOT-AUTHORIZED))
+      (fee-data (unwrap! (map-get? verifier-fees tx-sender) ERR-INVALID-FEE))
+      (users-count (len users))
+      (batch-id (var-get total-bulk-verifications))
+      (initial-acc {
+        successful: u0,
+        failed: u0,
+        total-fees: u0,
+        level: level,
+        verifier: tx-sender,
+        verifier-data: verifier-data,
+        fee-data: fee-data
+      })
+      (result (fold process-single-verification users initial-acc))
+      (successful-count (get successful result))
+      (failed-count (get failed result))
+      (total-fees (get total-fees result))
+      (platform-share (/ (* total-fees PLATFORM-FEE-PERCENTAGE) u100))
+      (verifier-share (- total-fees platform-share))
+    )
+    (asserts! (get active verifier-data) ERR-NOT-AUTHORIZED)
+    (asserts! (> users-count u0) ERR-EMPTY-BULK-LIST)
+    (asserts! (<= users-count MAX-BULK-VERIFICATIONS) ERR-BULK-LIST-TOO-LARGE)
+    (asserts! (<= level MAX-KYC-LEVEL) ERR-INVALID-LEVEL)
+    (map-set bulk-verification-batches batch-id {
+      verifier: tx-sender,
+      total-users: users-count,
+      successful-count: successful-count,
+      failed-count: failed-count,
+      total-fees-collected: total-fees,
+      processed-at: stacks-block-height,
+      level: level
+    })
+    (map-set verifier-earnings tx-sender
+      (+ (default-to u0 (map-get? verifier-earnings tx-sender)) verifier-share))
+    (var-set total-platform-earnings (+ (var-get total-platform-earnings) platform-share))
+    (map-set authorized-verifiers tx-sender
+      (merge verifier-data {
+        total-verifications: (+ (get total-verifications verifier-data) successful-count),
+        last-verification: stacks-block-height
+      }))
+    (var-set total-bulk-verifications (+ batch-id u1))
+    (ok {
+      batch-id: batch-id,
+      successful: successful-count,
+      failed: failed-count,
+      total-fees: total-fees
+    })))
+
+(define-read-only (get-bulk-verification-batch (batch-id uint))
+  (match (map-get? bulk-verification-batches batch-id)
+    batch (ok batch)
+    ERR-PENDING-NOT-FOUND))
+
+(define-read-only (get-bulk-verification-stats)
+  (ok {
+    total-bulk-verifications: (var-get total-bulk-verifications),
+    max-bulk-verifications: MAX-BULK-VERIFICATIONS
   }))
